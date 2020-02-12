@@ -1,0 +1,179 @@
+<?php
+
+/**
+ * @file
+ * Defines module logic.
+ */
+
+function opigno_student_export_app_menu() {
+  $items['admin/opigno/students/export'] = array(
+    'title' => "Export Students",
+    'description' => "Export lists of students of your courses and/or classes in Excel format.",
+    'page callback' => 'students_callback',
+    'access callback' => 'opigno_student_export_access',
+  );
+  return $items;
+}
+
+function opigno_student_export_access() {
+  return ((user_access('export student list')) || (user_access('export all student lists')));
+}
+
+function opigno_student_export_app_permission() {
+  return array(
+    'export student list' => array(
+      'title' => t('Export Student list'),
+      'description' => t('Allows the exportation of a list of students'),
+    ),
+    'export all student lists' => array(
+      'title' => t('Export all student lists'),
+      'description' => t('Allows the exportation of all student lists'),
+    ),
+  );
+}
+
+function opigno_student_export_app_og_permission() {
+  return array(
+    'export student list' => array(
+      'title' => t('Export Student list'),
+      'description' => t('Allows the exportation of a list of students'),
+    ),
+    'exclude export' => array(
+      'title' => t('Exclude from export'),
+      'description' => t('Allows the exportation of only certain role members of a group'),
+    ),
+  );
+}
+
+
+function students_callback() {
+  return drupal_get_form('students_form');
+}
+
+function opigno_student_export_getusersgroups() {
+  global $user;
+  if (user_access("export all student lists")) {
+    $groups = og_get_all_group('node');
+    // Force og_get_all_group() structure to be the same as og_get_groups_by_user()
+    foreach ($groups as $group_index => $groupid) {
+      $group1['node'][$groupid] = $groupid;
+    }
+    $groups = $group1;
+    $group1 = NULL;
+    /////////////////////////////////////////////////////
+  }
+  else {
+    $groups = og_get_groups_by_user($user, NULL);
+    foreach ($groups['node'] as $groupid => $group_id) {
+      if ((!og_user_access('node', $group_id, 'export student list'))) {
+        unset($groups['node'][$group_id]);
+      }
+    }
+  }
+  return $groups;
+}
+
+function students_form($form, &$form_state) {
+  global $user;
+  $groups = opigno_student_export_getusersgroups();
+  $form['groups'] = array(
+    '#type' => 'select',
+    '#title' => t('Groups'),
+    '#options' => array(
+      '-1' => t('None'),
+    ),
+    '#default_value' => 'None',
+    '#description' => t('Choose groups to export'),
+    '#ajax' => array(
+      'callback' => 'messaging_user_update_callback',
+      'wrapper' => 'recipient1-div',
+      'method' => 'replace',
+      'effect' => 'fade',
+    ),
+  );
+  foreach ($groups['node'] as $groupid => $group_id) {
+    $node = node_load($group_id);
+    $form['groups']['#options'][$node->type][$group_id] = $node->title;
+  }
+  $form['submit'] = array( //We define a simple submit button
+    '#type' => 'submit',
+    '#value' => t('Export students'),
+  );
+  $form['submit']['#submit'][] = 'opigno_student_export_app_submit';
+  return $form;
+}
+
+function opigno_student_export_getusersingroup($nodenid) {
+  global $user;
+  $users = entity_load('user');
+  foreach ($users as $user_) {
+    if (($user_->uid != 0) && ($user_->uid != $user->uid)) {
+      if (((og_is_member('node', $nodenid, 'user', $user_))) && (!og_user_access('node', $nodenid, 'exclude export', $user_))) {
+        $userstoexport[] = $user_->name;
+      }
+    }
+  }
+  return $userstoexport;
+}
+
+function opigno_student_export_app_submit($form, &$form_state) {
+  module_load_include('inc', 'opigno', 'opigno.rules');
+  if (($form_state['values']['groups']) == -1) {
+    drupal_set_message(t("Please select a class/course before exporting."), 'warning');
+    return NULL;
+  }
+  $node = node_load($form_state['values']['groups']);
+  Global $user;
+  //Create the export structure
+  $export['title'] = $node->title;
+  $export['exporter'] = $user->name;
+  $export['users'] = array();
+  $users = opigno_student_export_getusersingroup($node->nid);
+  foreach ($users as $user_) {
+    $export['users'][] = $user_;
+  }
+  //////////////////////////////////
+  $filename = "Students_" . preg_replace("/[^A-Za-z0-9]/", "", $node->title) . "_" . time() . ".xls";
+  opigno_student_export_app($export, $filename);
+  $http_headers = array(
+    'Content-Type' => 'text',
+    'Content-Disposition' => 'attachment; filename="' . $filename . '"',
+    'Content-Length' => filesize(get_stream_wrapper() . '://' . $filename),
+  );
+  if (strpos($_SERVER['HTTP_USER_AGENT'], 'MSIE')) {
+    $http_headers['Cache-Control'] = 'must-revalidate, post-check=0, pre-check=0';
+    $http_headers['Pragma'] = 'public';
+  }
+  else {
+    $http_headers['Pragma'] = 'no-cache';
+  }
+  file_transfer(get_stream_wrapper() . '://' . $filename, $http_headers);
+}
+
+function opigno_student_export_app($export, $filename) {
+  module_load_include('inc', 'phpexcel');
+  $headers['Students'] = array(t("Group") . " : " . $export['title'], t("Exporter") . " : " . $export['exporter']);
+  if (isset($value['Students']) && (sizeof($value['Students']) == 0)) {
+    $data['Students'][] = array('', '');
+  }
+  foreach ($export['users'] as $student) {
+    $data['Students'][] = array($student, '');
+  }
+  $dir = file_stream_wrapper_get_instance_by_uri(get_stream_wrapper() . '://')->realpath();
+  $path = "$dir/$filename";
+  $options = array('format' => 'xls', 'replace' => TRUE);
+  $result = phpexcel_export($headers, $data, $path, $options);
+  $handle = fopen($path, 'r');
+  $file = file_save_data($handle, get_stream_wrapper() . '://' . $filename);
+  $file->status = 0;
+  file_save($file);
+  fclose($handle);
+}
+
+function get_stream_wrapper() {
+  $private = file_stream_wrapper_get_instance_by_uri('private://');
+  if (!empty($private)) {
+    return 'private';
+  }
+  return 'public';
+}
